@@ -7,11 +7,23 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/neghoda/quiet_hn/hn"
 )
+
+const cachLifeDuration = 10 * time.Second
+
+type cach struct {
+	cashedItems  []item
+	expiration   time.Time
+	cachMutex    sync.Mutex
+	numStories   int
+	lifeDuration time.Duration
+}
 
 func main() {
 	// parse flags
@@ -29,27 +41,23 @@ func main() {
 }
 
 func handler(numStories int, tpl *template.Template) http.HandlerFunc {
+	c := cach{
+		expiration:   time.Now(),
+		numStories:   numStories,
+		lifeDuration: cachLifeDuration,
+	}
+	ticker := time.NewTicker(cachLifeDuration / 2)
+	go func() {
+		for {
+			c.updateCach()
+			<-ticker.C
+		}
+	}()
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
-		var client hn.Client
-		ids, err := client.TopItems()
+		stories, err := c.getTopStories()
 		if err != nil {
 			http.Error(w, "Failed to load top stories", http.StatusInternalServerError)
-			return
-		}
-		var stories []item
-		for _, id := range ids {
-			hnItem, err := client.GetItem(id)
-			if err != nil {
-				continue
-			}
-			item := parseHNItem(hnItem)
-			if isStoryLink(item) {
-				stories = append(stories, item)
-				if len(stories) >= numStories {
-					break
-				}
-			}
 		}
 		data := templateData{
 			Stories: stories,
@@ -61,6 +69,72 @@ func handler(numStories int, tpl *template.Template) http.HandlerFunc {
 			return
 		}
 	})
+}
+
+func (c *cach) getTopStories() ([]item, error) {
+	if !c.cachExpired() {
+		return c.cashedItems, nil
+	}
+	c.updateCach()
+	return c.cashedItems, nil
+}
+
+func (c *cach) updateCach() {
+	c.cachMutex.Lock()
+	defer c.cachMutex.Unlock()
+	tempCach, err := fetchTopStories(c.numStories)
+	if err != nil {
+		return
+	}
+	c.expiration = time.Now().Add(c.lifeDuration)
+	c.cashedItems = tempCach
+}
+
+func (c *cach) cachExpired() bool {
+	return time.Now().After(c.expiration)
+}
+
+func fetchTopStories(numStories int) ([]item, error) {
+	var client hn.Client
+	ids, err := client.TopItems()
+	if err != nil {
+		return nil, err
+	}
+	var stories []item
+	type result struct {
+		idx   int
+		item  item
+		error error
+	}
+	resChan := make(chan result)
+	wanted := numStories * 5 / 4
+	for i := 0; i < wanted; i++ {
+		go func(id int, idx int) {
+			hnItem, err := client.GetItem(id)
+			if err != nil {
+				resChan <- result{error: err}
+			}
+			resChan <- result{idx: idx, item: parseHNItem(hnItem)}
+		}(ids[i], i)
+	}
+	results := make([]result, 0, numStories)
+	for len(results) < numStories {
+		res := <-resChan
+		if res.error != nil {
+			continue
+		}
+		if isStoryLink(res.item) {
+			results = append(results, res)
+		}
+	}
+
+	sort.Slice(results, func(i, j int) bool {
+		return results[i].idx < results[j].idx
+	})
+	for _, v := range results {
+		stories = append(stories, v.item)
+	}
+	return stories, nil
 }
 
 func isStoryLink(item item) bool {
